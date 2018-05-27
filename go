@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
-if [ ! -d apache-maven-3.5.2 ]; then
-    wget http://apache.mirror.amaze.com.au/maven/maven-3/3.5.2/binaries/apache-maven-3.5.2-bin.tar.gz
-    tar xvf apache-maven-3.5.2-bin.tar.gz
-    ln -s apache-maven-3.5.2/bin/mvn mvn
-    rm apache-maven-3.5.2-bin.tar.gz
+if [ ! -d apache-maven-3.5.3 ]; then
+    wget http://apache.mirror.amaze.com.au/maven/maven-3/3.5.3/binaries/apache-maven-3.5.3-bin.tar.gz
+    tar xvf apache-maven-3.5.3-bin.tar.gz
+    ln -s apache-maven-3.5.3/bin/mvn mvn
+    rm apache-maven-3.5.3-bin.tar.gz
 fi
 
 ./dev/change_scala_version.sh 2.11
