@@ -35,7 +35,10 @@ function NotebookCtrl($scope, $route, $routeParams, $location, $rootScope,
   $scope.viewOnly = false;
   $scope.showSetting = false;
   $scope.showRevisionsComparator = false;
+  $scope.collaborativeMode = false;
+  $scope.collaborativeModeUsers = [];
   $scope.looknfeelOption = ['default', 'simple', 'report'];
+  $scope.noteFormTitle = null;
   $scope.cronOption = [
     {name: 'None', value: undefined},
     {name: '1m', value: '0 0/1 * * * ?'},
@@ -441,22 +444,25 @@ function NotebookCtrl($scope, $route, $routeParams, $location, $rootScope,
     }
   };
 
+  $scope.setNoteFormTitle = function(noteFormTitle) {
+    $scope.note.config.noteFormTitle = noteFormTitle;
+    $scope.setConfig();
+  };
+
   /** Set cron expression for this note **/
   $scope.setCronScheduler = function(cronExpr) {
     if (cronExpr) {
       if (!$scope.note.config.cronExecutingUser) {
         $scope.note.config.cronExecutingUser = $rootScope.ticket.principal;
       }
+      if (!$scope.note.config.cronExecutingRoles) {
+        $scope.note.config.cronExecutingRoles = $rootScope.ticket.roles;
+      }
     } else {
       $scope.note.config.cronExecutingUser = '';
+      $scope.note.config.cronExecutingRoles = '';
     }
     $scope.note.config.cron = cronExpr;
-    $scope.setConfig();
-  };
-
-  /** Set the username of the user to be used to execute all notes in notebook **/
-  $scope.setCronExecutingUser = function(cronExecutingUser) {
-    $scope.note.config.cronExecutingUser = cronExecutingUser;
     $scope.setConfig();
   };
 
@@ -1253,6 +1259,16 @@ function NotebookCtrl($scope, $route, $routeParams, $location, $rootScope,
     $scope.saveCursorPosition(paragraph);
   });
 
+  $scope.$on('collaborativeModeStatus', function(event, data) {
+    $scope.collaborativeMode = Boolean(data.status);
+    $scope.collaborativeModeUsers = data.users;
+  });
+
+  $scope.$on('patchReceived', function(event, data) {
+    $scope.collaborativeMode = true;
+  });
+
+
   $scope.$on('runAllBelowAndCurrent', function(event, paragraph, isNeedConfirm) {
     let allParagraphs = $scope.note.paragraphs;
     let toRunParagraphs = [];
@@ -1500,7 +1516,7 @@ function NotebookCtrl($scope, $route, $routeParams, $location, $rootScope,
   });
 
   $scope.isShowNoteForms = function() {
-    if ($scope.note && !angular.equals({}, $scope.note.noteForms)) {
+    if ($scope.note && !_.isEmpty($scope.note.noteForms) && !$scope.paragraphUrl) {
       return true;
     }
     return false;
