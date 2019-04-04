@@ -16,10 +16,8 @@
  */
 package org.apache.zeppelin.realm;
 
+import java.util.LinkedHashMap;
 import org.apache.commons.lang.StringUtils;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.security.alias.CredentialProvider;
-import org.apache.hadoop.security.alias.CredentialProviderFactory;
 import org.apache.shiro.authc.AuthenticationException;
 import org.apache.shiro.authc.AuthenticationInfo;
 import org.apache.shiro.authc.AuthenticationToken;
@@ -68,7 +66,19 @@ public class ActiveDirectoryGroupRealm extends AbstractLdapRealm {
   private static final String ROLE_NAMES_DELIMETER = ",";
 
   final String keystorePass = "activeDirectoryRealm.systemPassword";
+
+  private String userSearchAttributeName = "sAMAccountName";
+
   private String hadoopSecurityCredentialPath;
+
+  public String getUserSearchAttributeName() {
+    return userSearchAttributeName;
+  }
+
+  public void setUserSearchAttributeName(String userSearchAttributeName) {
+    this.userSearchAttributeName = userSearchAttributeName;
+  }
+
 
   public void setHadoopSecurityCredentialPath(String hadoopSecurityCredentialPath) {
     this.hadoopSecurityCredentialPath = hadoopSecurityCredentialPath;
@@ -79,10 +89,10 @@ public class ActiveDirectoryGroupRealm extends AbstractLdapRealm {
    * group names (e.g. CN=Group,OU=Company,DC=MyDomain,DC=local)
    * as returned by the active directory LDAP server to role names.
    */
-  private Map<String, String> groupRolesMap;
+  private Map<String, String> groupRolesMap = new LinkedHashMap<>();
 
   public void setGroupRolesMap(Map<String, String> groupRolesMap) {
-    this.groupRolesMap = groupRolesMap;
+    this.groupRolesMap.putAll(groupRolesMap);
   }
 
   LdapContextFactory ldapContextFactory;
@@ -141,19 +151,7 @@ public class ActiveDirectoryGroupRealm extends AbstractLdapRealm {
     if (StringUtils.isEmpty(this.hadoopSecurityCredentialPath)) {
       password = this.systemPassword;
     } else {
-      try {
-        Configuration configuration = new Configuration();
-        configuration.set(CredentialProviderFactory.CREDENTIAL_PROVIDER_PATH,
-                this.hadoopSecurityCredentialPath);
-        CredentialProvider provider = CredentialProviderFactory.getProviders(configuration).get(0);
-        CredentialProvider.CredentialEntry credEntry = provider.getCredentialEntry(
-                keystorePass);
-        if (credEntry != null) {
-          password = new String(credEntry.getCredential());
-        }
-      } catch (Exception e) {
-        log.debug("ignored error from getting credential entry from keystore", e);
-      }
+      password = LdapRealm.getSystemPassword(hadoopSecurityCredentialPath, keystorePass);
     }
     return password;
   }
@@ -252,14 +250,17 @@ public class ActiveDirectoryGroupRealm extends AbstractLdapRealm {
     return new SimpleAuthorizationInfo(roleNames);
   }
 
-  public List<String> searchForUserName(String containString, LdapContext ldapContext)
+  public List<String> searchForUserName(String containString, LdapContext ldapContext,
+      int numUsersToFetch)
           throws NamingException {
     List<String> userNameList = new ArrayList<>();
 
     SearchControls searchCtls = new SearchControls();
     searchCtls.setSearchScope(SearchControls.SUBTREE_SCOPE);
+    searchCtls.setCountLimit(numUsersToFetch);
 
-    String searchFilter = "(&(objectClass=*)(userPrincipalName=*" + containString + "*))";
+    String searchFilter = String.format("(&(objectClass=*)(%s=*%s*))", this.getUserSearchAttributeName(), containString);
+
     Object[] searchArguments = new Object[]{containString};
 
     NamingEnumeration answer = ldapContext.search(searchBase, searchFilter, searchArguments,
@@ -277,7 +278,7 @@ public class ActiveDirectoryGroupRealm extends AbstractLdapRealm {
         NamingEnumeration ae = attrs.getAll();
         while (ae.hasMore()) {
           Attribute attr = (Attribute) ae.next();
-          if (attr.getID().toLowerCase().equals("cn")) {
+          if (attr.getID().toLowerCase().equals(this.getUserSearchAttributeName().toLowerCase())) {
             userNameList.addAll(LdapUtils.getAllAttributeValues(attr));
           }
         }
@@ -303,11 +304,11 @@ public class ActiveDirectoryGroupRealm extends AbstractLdapRealm {
     SearchControls searchCtls = new SearchControls();
     searchCtls.setSearchScope(SearchControls.SUBTREE_SCOPE);
     String userPrincipalName = username;
-    if (this.principalSuffix != null && userPrincipalName.indexOf('@') < 0) {
-      userPrincipalName += principalSuffix;
+    if (this.principalSuffix != null && userPrincipalName.indexOf('@') > 1) {
+      userPrincipalName = userPrincipalName.split("@")[0];
     }
 
-    String searchFilter = "(&(objectClass=*)(userPrincipalName=" + userPrincipalName + "))";
+    String searchFilter = String.format("(&(objectClass=*)(%s=%s))", this.getUserSearchAttributeName(), userPrincipalName);
     Object[] searchArguments = new Object[]{userPrincipalName};
 
     NamingEnumeration answer = ldapContext.search(searchBase, searchFilter, searchArguments,

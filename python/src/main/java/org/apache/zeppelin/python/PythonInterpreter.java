@@ -17,6 +17,7 @@
 
 package org.apache.zeppelin.python;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.io.Files;
 import com.google.gson.Gson;
 import org.apache.commons.exec.CommandLine;
@@ -38,8 +39,6 @@ import org.apache.zeppelin.interpreter.InterpreterResult;
 import org.apache.zeppelin.interpreter.InterpreterResult.Code;
 import org.apache.zeppelin.interpreter.InterpreterResultMessage;
 import org.apache.zeppelin.interpreter.InvalidHookException;
-import org.apache.zeppelin.interpreter.LazyOpenInterpreter;
-import org.apache.zeppelin.interpreter.WrappedInterpreter;
 import org.apache.zeppelin.interpreter.remote.RemoteInterpreterUtils;
 import org.apache.zeppelin.interpreter.thrift.InterpreterCompletion;
 import org.apache.zeppelin.interpreter.util.InterpreterOutputStream;
@@ -47,14 +46,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import py4j.GatewayServer;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.net.Inet4Address;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -62,13 +56,13 @@ import java.util.Properties;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- *  Interpreter for Python, it is the first implementation of interpreter for Python, so with less
- *  features compared to IPythonInterpreter, but requires less prerequisites than
- *  IPythonInterpreter, only python installation is required.
+ * Interpreter for Python, it is the first implementation of interpreter for Python, so with less
+ * features compared to IPythonInterpreter, but requires less prerequisites than
+ * IPythonInterpreter, only python installation is required.
  */
 public class PythonInterpreter extends Interpreter implements ExecuteResultHandler {
   private static final Logger LOGGER = LoggerFactory.getLogger(PythonInterpreter.class);
-  private static final int MAX_TIMEOUT_SEC = 10;
+  private static final int MAX_TIMEOUT_SEC = 30;
 
   private GatewayServer gatewayServer;
   private DefaultExecutor executor;
@@ -83,6 +77,7 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
   private IPythonInterpreter iPythonInterpreter;
   private BaseZeppelinContext zeppelinContext;
   private String condaPythonExec;  // set by PythonCondaInterpreter
+  private boolean usePy4jAuth = false;
 
   public PythonInterpreter(Properties property) {
     super(property);
@@ -120,6 +115,7 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     }
 
     try {
+      this.usePy4jAuth = Boolean.parseBoolean(getProperty("zeppelin.py4j.useAuth", "true"));
       createGatewayServerAndStartScript();
     } catch (IOException e) {
       LOGGER.error("Fail to open PythonInterpreter", e);
@@ -133,17 +129,11 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     int port = RemoteInterpreterUtils.findRandomAvailablePortOnAllLocalInterfaces();
     // use the FQDN as the server address instead of 127.0.0.1 so that python process in docker
     // container can also connect to this gateway server.
-    String serverAddress = getLocalIP();
-    gatewayServer = new GatewayServer(this,
-        port,
-        GatewayServer.DEFAULT_PYTHON_PORT,
-        InetAddress.getByName(serverAddress),
-        InetAddress.getByName(serverAddress),
-        GatewayServer.DEFAULT_CONNECT_TIMEOUT,
-        GatewayServer.DEFAULT_READ_TIMEOUT,
-        (List) null);;
+    String serverAddress = PythonUtils.getLocalIP(properties);
+    String secret = PythonUtils.createSecret(256);
+    this.gatewayServer = PythonUtils.createGatewayServer(this, serverAddress, port, secret,
+        usePy4jAuth);
     gatewayServer.start();
-    LOGGER.info("Starting GatewayServer at " + serverAddress + ":" + port);
 
     // launch python process to connect to the gateway server in JVM side
     createPythonScript();
@@ -161,12 +151,19 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     PumpStreamHandler streamHandler = new PumpStreamHandler(outputStream);
     executor.setStreamHandler(streamHandler);
     executor.setWatchdog(new ExecuteWatchdog(ExecuteWatchdog.INFINITE_TIMEOUT));
-
     Map<String, String> env = setupPythonEnv();
+    if (usePy4jAuth) {
+      env.put("PY4J_GATEWAY_SECRET", secret);
+    }
     LOGGER.info("Launching Python Process Command: " + cmd.getExecutable() +
         " " + StringUtils.join(cmd.getArguments(), " "));
     executor.execute(cmd, env, this);
     pythonScriptRunning.set(true);
+  }
+
+  @VisibleForTesting
+  public DefaultExecutor getPythonExecutor() {
+    return this.executor;
   }
 
   private void createPythonScript() throws IOException {
@@ -184,29 +181,11 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     copyResourceToPythonWorkDir("python/zeppelin_context.py", "zeppelin_context.py");
     copyResourceToPythonWorkDir("python/backend_zinline.py", "backend_zinline.py");
     copyResourceToPythonWorkDir("python/mpl_config.py", "mpl_config.py");
-    copyResourceToPythonWorkDir("python/py4j-src-0.9.2.zip", "py4j-src-0.9.2.zip");
+    copyResourceToPythonWorkDir("python/py4j-src-0.10.7.zip", "py4j-src-0.10.7.zip");
   }
 
   protected boolean useIPython() {
     return this.iPythonInterpreter != null;
-  }
-
-  private String getLocalIP() {
-    // zeppelin.python.gatewayserver_address is only for unit test on travis.
-    // Because the FQDN would fail unit test on travis ci.
-    String gatewayserver_address =
-        properties.getProperty("zeppelin.python.gatewayserver_address");
-    if (gatewayserver_address != null) {
-      return gatewayserver_address;
-    }
-
-    try {
-      return Inet4Address.getLocalHost().getHostAddress();
-    } catch (UnknownHostException e) {
-      LOGGER.warn("can't get local IP", e);
-    }
-    // fall back to loopback addreess
-    return "127.0.0.1";
   }
 
   private void copyResourceToPythonWorkDir(String srcResourceName,
@@ -228,7 +207,7 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     Map<String, String> env = EnvironmentUtils.getProcEnvironment();
     appendToPythonPath(env, pythonWorkDir.getAbsolutePath());
     if (useBuiltinPy4j) {
-      appendToPythonPath(env, pythonWorkDir.getAbsolutePath() + "/py4j-src-0.9.2.zip");
+      appendToPythonPath(env, pythonWorkDir.getAbsolutePath() + "/py4j-src-0.10.7.zip");
     }
     LOGGER.info("PYTHONPATH: " + env.get("PYTHONPATH"));
     return env;
@@ -292,10 +271,16 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
   public class PythonInterpretRequest {
     public String statements;
     public boolean isForCompletion;
+    public boolean isCallHooks;
 
     public PythonInterpretRequest(String statements, boolean isForCompletion) {
+      this(statements, isForCompletion, true);
+    }
+
+    public PythonInterpretRequest(String statements, boolean isForCompletion, boolean isCallHooks) {
       this.statements = statements;
       this.isForCompletion = isForCompletion;
+      this.isCallHooks = isCallHooks;
     }
 
     public String statements() {
@@ -304,6 +289,10 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
 
     public boolean isForCompletion() {
       return isForCompletion;
+    }
+
+    public boolean isCallHooks() {
+      return isCallHooks;
     }
   }
 
@@ -363,10 +352,11 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     }
 
     synchronized (statementFinishedNotifier) {
-      while (statementOutput == null) {
+      while (statementOutput == null && pythonScriptRunning.get()) {
         try {
           statementFinishedNotifier.wait(1000);
         } catch (InterruptedException e) {
+          // ignore this exception
         }
       }
     }
@@ -388,7 +378,7 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
 
     synchronized (pythonScriptInitialized) {
       long startTime = System.currentTimeMillis();
-      while (!pythonScriptInitialized.get()
+      while (!pythonScriptInitialized.get() && pythonScriptRunning.get()
           && System.currentTimeMillis() - startTime < MAX_TIMEOUT_SEC * 1000) {
         try {
           LOGGER.info("Wait for PythonScript initialized");
@@ -431,7 +421,12 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
       } catch (IOException e) {
         throw new InterpreterException(e);
       }
-      return new InterpreterResult(Code.SUCCESS);
+      if (pythonScriptRunning.get()) {
+        return new InterpreterResult(Code.SUCCESS);
+      } else {
+        return new InterpreterResult(Code.ERROR,
+                "Python process is abnormally exited, please check your code and log.");
+      }
     }
   }
 
@@ -522,7 +517,7 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     }
 
     List<InterpreterCompletion> results = new LinkedList<>();
-    for (String name: completionList) {
+    for (String name : completionList) {
       results.add(new InterpreterCompletion(name, name, StringUtils.EMPTY));
     }
     return results;
@@ -538,8 +533,7 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     String completionScriptText = "";
     try {
       completionScriptText = text.substring(0, cursor);
-    }
-    catch (Exception e) {
+    } catch (Exception e) {
       LOGGER.error(e.toString());
       return null;
     }
@@ -558,30 +552,17 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
 
     if (completionStartPosition == completionEndPosition) {
       completionStartPosition = 0;
-    }
-    else
-    {
+    } else {
       completionStartPosition = completionEndPosition - completionStartPosition;
     }
     resultCompletionText = completionScriptText.substring(
-        completionStartPosition , completionEndPosition);
+        completionStartPosition, completionEndPosition);
 
     return resultCompletionText;
   }
 
-  protected IPythonInterpreter getIPythonInterpreter() {
-    LazyOpenInterpreter lazy = null;
-    IPythonInterpreter iPython = null;
-    Interpreter p = getInterpreterInTheSameSessionByClassName(IPythonInterpreter.class.getName());
-
-    while (p instanceof WrappedInterpreter) {
-      if (p instanceof LazyOpenInterpreter) {
-        lazy = (LazyOpenInterpreter) p;
-      }
-      p = ((WrappedInterpreter) p).getInnerInterpreter();
-    }
-    iPython = (IPythonInterpreter) p;
-    return iPython;
+  protected IPythonInterpreter getIPythonInterpreter() throws InterpreterException {
+    return getInterpreterInTheSameSessionByClassName(IPythonInterpreter.class, false);
   }
 
   protected BaseZeppelinContext createZeppelinContext() {
@@ -602,7 +583,9 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     String bootstrapCode =
         IOUtils.toString(getClass().getClassLoader().getResourceAsStream(resourceName));
     try {
-      InterpreterResult result = interpret(bootstrapCode, InterpreterContext.get());
+      // Add hook explicitly, otherwise python will fail to execute the statement
+      InterpreterResult result = interpret(bootstrapCode + "\n" + "__zeppelin__._displayhook()",
+          InterpreterContext.get());
       if (result.code() != Code.SUCCESS) {
         throw new IOException("Fail to run bootstrap script: " + resourceName);
       }
@@ -616,6 +599,9 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     LOGGER.info("python process terminated. exit code " + exitValue);
     pythonScriptRunning.set(false);
     pythonScriptInitialized.set(false);
+    synchronized (statementFinishedNotifier) {
+      statementFinishedNotifier.notify();
+    }
   }
 
   @Override
@@ -623,6 +609,9 @@ public class PythonInterpreter extends Interpreter implements ExecuteResultHandl
     LOGGER.error("python process failed", e);
     pythonScriptRunning.set(false);
     pythonScriptInitialized.set(false);
+    synchronized (statementFinishedNotifier) {
+      statementFinishedNotifier.notify();
+    }
   }
 
   // Called by Python Process, used for debugging purpose
