@@ -101,11 +101,12 @@ public class SparkRInterpreter extends Interpreter {
       ZeppelinRContext.setSparkSession(sparkInterpreter.getSparkSession());
     }
     ZeppelinRContext.setSqlContext(sparkInterpreter.getSQLContext());
-    ZeppelinRContext.setZeppelinContext((SparkZeppelinContext) sparkInterpreter.getZeppelinContext());
+    ZeppelinRContext.setZeppelinContext(sparkInterpreter.getZeppelinContext());
 
     zeppelinR = new ZeppelinR(rCmdPath, sparkRLibPath, SparkRBackend.port(), sparkVersion, timeout, this);
     try {
       zeppelinR.open();
+      logger.info("ZeppelinR is opened successfully.");
     } catch (IOException e) {
       throw new InterpreterException("Exception while opening SparkRInterpreter", e);
     }
@@ -121,7 +122,8 @@ public class SparkRInterpreter extends Interpreter {
   @Override
   public InterpreterResult interpret(String lines, InterpreterContext interpreterContext)
       throws InterpreterException {
-
+    Utils.printDeprecateMessage(sparkInterpreter.getSparkVersion(),
+            interpreterContext, properties);
     String jobGroup = Utils.buildJobGroupId(interpreterContext);
     String jobDesc = Utils.buildJobDesc(interpreterContext);
     sparkInterpreter.getSparkContext().setJobGroup(jobGroup, jobDesc, false);
@@ -166,7 +168,7 @@ public class SparkRInterpreter extends Interpreter {
 
         return new InterpreterResult(
             rDisplay.code(),
-            rDisplay.type(),
+            rDisplay.typ(),
             rDisplay.content()
         );
       } else {
@@ -182,8 +184,9 @@ public class SparkRInterpreter extends Interpreter {
   }
 
   @Override
-  public void close() {
+  public void close() throws InterpreterException {
     zeppelinR.close();
+    this.sparkInterpreter.close();
   }
 
   @Override

@@ -16,7 +16,6 @@
  */
 package org.apache.zeppelin.integration;
 
-import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.zeppelin.conf.ZeppelinConfiguration;
 import org.apache.zeppelin.display.AngularObject;
@@ -25,6 +24,7 @@ import org.apache.zeppelin.interpreter.InterpreterNotFoundException;
 import org.apache.zeppelin.interpreter.InterpreterProperty;
 import org.apache.zeppelin.interpreter.InterpreterResult;
 import org.apache.zeppelin.interpreter.InterpreterSetting;
+import org.apache.zeppelin.interpreter.integration.DownloadUtils;
 import org.apache.zeppelin.interpreter.thrift.InterpreterCompletion;
 import org.apache.zeppelin.notebook.Note;
 import org.apache.zeppelin.notebook.Notebook;
@@ -36,8 +36,6 @@ import org.apache.zeppelin.utils.TestUtils;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,7 +43,6 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.StringReader;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -70,12 +67,13 @@ public abstract class ZeppelinSparkClusterTest extends AbstractTestRestApi {
 
 
   private String sparkVersion;
+  private String sparkHome;
   private AuthenticationInfo anonymous = new AuthenticationInfo("anonymous");
 
   public ZeppelinSparkClusterTest(String sparkVersion) throws Exception {
     this.sparkVersion = sparkVersion;
     LOGGER.info("Testing SparkVersion: " + sparkVersion);
-    String sparkHome = DownloadUtils.downloadSpark(sparkVersion);
+    this.sparkHome = DownloadUtils.downloadSpark(sparkVersion);
     if (!verifiedSparkVersions.contains(sparkVersion)) {
       verifiedSparkVersions.add(sparkVersion);
       setupSparkInterpreter(sparkHome);
@@ -112,6 +110,8 @@ public abstract class ZeppelinSparkClusterTest extends AbstractTestRestApi {
             new InterpreterProperty("spark.serializer", "org.apache.spark.serializer.KryoSerializer"));
     sparkProperties.put("zeppelin.spark.scala.color",
             new InterpreterProperty("zeppelin.spark.scala.color", "false"));
+    sparkProperties.put("zeppelin.spark.deprecatedMsg.show",
+            new InterpreterProperty("zeppelin.spark.deprecatedMsg.show", "false"));
     TestUtils.getInstance(Notebook.class).getInterpreterSettingManager().restart(sparkIntpSetting.getId());
   }
 
@@ -580,48 +580,7 @@ public abstract class ZeppelinSparkClusterTest extends AbstractTestRestApi {
       }
     }
   }
-
-  @Test
-  public void pySparkDepLoaderTest() throws IOException {
-    Note note = null;
-    try {
-      note = TestUtils.getInstance(Notebook.class).createNote("note1", anonymous);
-
-      // restart spark interpreter to make dep loader work
-      TestUtils.getInstance(Notebook.class).getInterpreterSettingManager().close();
-
-      // load dep
-      Paragraph p0 = note.addNewParagraph(anonymous);
-      p0.setText("%dep z.load(\"com.databricks:spark-csv_2.11:1.2.0\")");
-      note.run(p0.getId(), true);
-      assertEquals(Status.FINISHED, p0.getStatus());
-
-      // write test csv file
-      File tmpFile = File.createTempFile("test", "csv");
-      FileUtils.write(tmpFile, "a,b\n1,2");
-
-      // load data using libraries from dep loader
-      Paragraph p1 = note.addNewParagraph(anonymous);
-
-      String sqlContextName = "sqlContext";
-      if (isSpark2()) {
-        sqlContextName = "spark";
-      }
-      p1.setText("%pyspark\n" +
-          "from pyspark.sql import SQLContext\n" +
-          "print(" + sqlContextName + ".read.format('com.databricks.spark.csv')" +
-          ".load('file://" + tmpFile.getAbsolutePath() + "').count())");
-      note.run(p1.getId(), true);
-
-      assertEquals(Status.FINISHED, p1.getStatus());
-      assertEquals("2\n", p1.getReturn().message().get(0).getData());
-    } finally {
-      if (null != note) {
-        TestUtils.getInstance(Notebook.class).removeNote(note.getId(), anonymous);
-      }
-    }
-  }
-
+  
   private void verifySparkVersionNumber() throws IOException {
     Note note = null;
     try {
@@ -799,6 +758,43 @@ public abstract class ZeppelinSparkClusterTest extends AbstractTestRestApi {
       if (null != note) {
         TestUtils.getInstance(Notebook.class).removeNote(note.getId(), anonymous);
       }
+    }
+  }
+
+  @Test
+  public void testFailtoLaunchSpark() throws IOException {
+    Note note = null;
+    try {
+      TestUtils.getInstance(Notebook.class).getInterpreterSettingManager().close();
+      note = TestUtils.getInstance(Notebook.class).createNote("note1", anonymous);
+      Paragraph p = note.addNewParagraph(anonymous);
+      p.setText("%spark.conf SPARK_HOME invalid_spark_home");
+      note.run(p.getId(), true);
+      assertEquals(Status.FINISHED, p.getStatus());
+
+      Paragraph p1 = note.addNewParagraph(anonymous);
+      p1.setText("%spark\nsc.version");
+      note.run(p1.getId(), true);
+      assertEquals(Status.ERROR, p1.getStatus());
+      assertTrue("Actual error message: " + p1.getReturn().message().get(0).getData(),
+              p1.getReturn().message().get(0).getData().contains("No such file or directory"));
+
+      // run it again, and get the same error
+      note.run(p1.getId(), true);
+      assertEquals(Status.ERROR, p1.getStatus());
+      assertTrue("Actual error message: " + p1.getReturn().message().get(0).getData(),
+              p1.getReturn().message().get(0).getData().contains("No such file or directory"));
+    } finally {
+      if (null != note) {
+        TestUtils.getInstance(Notebook.class).removeNote(note.getId(), anonymous);
+      }
+      // reset SPARK_HOME, otherwise it will cause the following test fail
+      InterpreterSetting sparkIntpSetting = TestUtils.getInstance(Notebook.class).getInterpreterSettingManager()
+              .getInterpreterSettingByName("spark");
+      Map<String, InterpreterProperty> sparkProperties =
+              (Map<String, InterpreterProperty>) sparkIntpSetting.getProperties();
+      sparkProperties.put("SPARK_HOME", new InterpreterProperty("SPARK_HOME", sparkHome));
+      sparkIntpSetting.close();
     }
   }
 }

@@ -31,6 +31,7 @@ import org.apache.zeppelin.interpreter.InterpreterFactory;
 import org.apache.zeppelin.interpreter.InterpreterResult;
 import org.apache.zeppelin.interpreter.InterpreterSetting;
 import org.apache.zeppelin.interpreter.InterpreterSettingManager;
+import org.apache.zeppelin.interpreter.integration.DownloadUtils;
 import org.codehaus.plexus.util.xml.pull.XmlPullParserException;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -89,6 +90,7 @@ public abstract class SparkIntegrationTest {
     // add jars & packages for testing
     InterpreterSetting sparkInterpreterSetting = interpreterSettingManager.getInterpreterSettingByName("spark");
     sparkInterpreterSetting.setProperty("spark.jars.packages", "com.maxmind.geoip2:geoip2:2.5.0");
+    sparkInterpreterSetting.setProperty("SPARK_PRINT_LAUNCH_COMMAND", "true");
     MavenXpp3Reader reader = new MavenXpp3Reader();
     Model model = reader.read(new FileReader("pom.xml"));
     sparkInterpreterSetting.setProperty("spark.jars", new File("target/zeppelin-interpreter-integration-" + model.getVersion() + ".jar").getAbsolutePath());
@@ -134,7 +136,7 @@ public abstract class SparkIntegrationTest {
     } else {
       interpreterResult = sparkrInterpreter.interpret("df <- createDataFrame(sqlContext, faithful)\nhead(df)", context);
     }
-    assertEquals(InterpreterResult.Code.SUCCESS, interpreterResult.code());
+    assertEquals(interpreterResult.toString(), InterpreterResult.Code.SUCCESS, interpreterResult.code());
     assertEquals(InterpreterResult.Type.TEXT, interpreterResult.message().get(0).getType());
     assertTrue(interpreterResult.message().get(0).getData().contains("eruptions waiting"));
   }
@@ -148,6 +150,7 @@ public abstract class SparkIntegrationTest {
     sparkInterpreterSetting.setProperty("zeppelin.spark.useHiveContext", "false");
     sparkInterpreterSetting.setProperty("zeppelin.pyspark.useIPython", "false");
     sparkInterpreterSetting.setProperty("zeppelin.spark.scala.color", "false");
+    sparkInterpreterSetting.setProperty("zeppelin.spark.deprecatedMsg.show", "false");
 
     testInterpreterBasics();
 
@@ -171,6 +174,7 @@ public abstract class SparkIntegrationTest {
     sparkInterpreterSetting.setProperty("PYSPARK_PYTHON", getPythonExec());
     sparkInterpreterSetting.setProperty("spark.driver.memory", "512m");
     sparkInterpreterSetting.setProperty("zeppelin.spark.scala.color", "false");
+    sparkInterpreterSetting.setProperty("zeppelin.spark.deprecatedMsg.show", "false");
 
     testInterpreterBasics();
 
@@ -180,6 +184,27 @@ public abstract class SparkIntegrationTest {
     assertEquals(1, response.getApplicationList().size());
 
     interpreterSettingManager.close();
+
+    waitForYarnAppCompleted(30 * 1000);
+  }
+
+  private void waitForYarnAppCompleted(int timeout) throws YarnException {
+    long start = System.currentTimeMillis();
+    boolean yarnAppCompleted = false;
+    while ((System.currentTimeMillis() - start) < timeout ) {
+      GetApplicationsRequest request = GetApplicationsRequest.newInstance(EnumSet.of(YarnApplicationState.RUNNING));
+      GetApplicationsResponse response = hadoopCluster.getYarnCluster().getResourceManager().getClientRMService().getApplications(request);
+      if (response.getApplicationList().isEmpty()) {
+        yarnAppCompleted = true;
+        break;
+      }
+      try {
+        Thread.sleep(1000);
+      } catch (InterruptedException e) {
+        e.printStackTrace();
+      }
+    }
+    assertTrue("Yarn app is not completed in " + timeout + " milliseconds.", yarnAppCompleted);
   }
 
   @Test
@@ -194,6 +219,7 @@ public abstract class SparkIntegrationTest {
     sparkInterpreterSetting.setProperty("PYSPARK_PYTHON", getPythonExec());
     sparkInterpreterSetting.setProperty("spark.driver.memory", "512m");
     sparkInterpreterSetting.setProperty("zeppelin.spark.scala.color", "false");
+    sparkInterpreterSetting.setProperty("zeppelin.spark.deprecatedMsg.show", "false");
 
     testInterpreterBasics();
 
@@ -203,6 +229,8 @@ public abstract class SparkIntegrationTest {
     assertEquals(1, response.getApplicationList().size());
 
     interpreterSettingManager.close();
+
+    waitForYarnAppCompleted(30 * 1000);
   }
 
   private boolean isSpark2() {

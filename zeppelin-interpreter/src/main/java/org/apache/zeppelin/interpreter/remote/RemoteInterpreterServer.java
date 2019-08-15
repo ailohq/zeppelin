@@ -19,6 +19,7 @@ package org.apache.zeppelin.interpreter.remote;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
+import org.apache.commons.lang.exception.ExceptionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
@@ -28,6 +29,10 @@ import org.apache.thrift.transport.TServerSocket;
 import org.apache.thrift.transport.TSocket;
 import org.apache.thrift.transport.TTransport;
 import org.apache.thrift.transport.TTransportException;
+import org.apache.zeppelin.cluster.ClusterManagerClient;
+import org.apache.zeppelin.cluster.meta.ClusterMeta;
+import org.apache.zeppelin.cluster.meta.ClusterMetaType;
+import org.apache.zeppelin.conf.ZeppelinConfiguration;
 import org.apache.zeppelin.dep.DependencyResolver;
 import org.apache.zeppelin.display.AngularObject;
 import org.apache.zeppelin.display.AngularObjectRegistry;
@@ -82,8 +87,10 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.nio.ByteBuffer;
+import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -131,6 +138,10 @@ public class RemoteInterpreterServer extends Thread
 
   private boolean isTest;
 
+  // cluster manager client
+  ClusterManagerClient clusterManagerClient = ClusterManagerClient.getInstance();
+  ZeppelinConfiguration zconf = ZeppelinConfiguration.create();
+
   public RemoteInterpreterServer(String intpEventServerHost,
                                  int intpEventServerPort,
                                  String interpreterGroupId,
@@ -177,6 +188,8 @@ public class RemoteInterpreterServer extends Thread
     server = new TThreadPoolServer(
         new TThreadPoolServer.Args(serverTransport).processor(processor));
     remoteWorksResponsePool = Collections.synchronizedMap(new HashMap<String, Object>());
+
+    clusterManagerClient.start(interpreterGroupId);
   }
 
   @Override
@@ -195,16 +208,24 @@ public class RemoteInterpreterServer extends Thread
             }
           }
 
-          if (!interrupted) {
-            RegisterInfo registerInfo = new RegisterInfo(host, port, interpreterGroupId);
-            try {
-              intpEventServiceClient.registerInterpreterProcess(registerInfo);
-            } catch (TException e) {
-              logger.error("Error while registering interpreter: {}", registerInfo, e);
+          if (zconf.isClusterMode()) {
+            // Cluster mode, discovering interpreter processes through metadata registration
+            // TODO (Xun): Unified use of cluster metadata for process discovery of all operating modes
+            // 1. Can optimize the startup logic of the process
+            // 2. Can solve the problem that running the interpreter's IP in docker may be a virtual IP
+            putClusterMeta();
+          } else {
+            if (!interrupted) {
+              RegisterInfo registerInfo = new RegisterInfo(host, port, interpreterGroupId);
               try {
-                shutdown();
-              } catch (TException e1) {
-                logger.warn("Exception occurs while shutting down", e1);
+                intpEventServiceClient.registerInterpreterProcess(registerInfo);
+              } catch (TException e) {
+                logger.error("Error while registering interpreter: {}", registerInfo, e);
+                try {
+                  shutdown();
+                } catch (TException e1) {
+                  logger.warn("Exception occurs while shutting down", e1);
+                }
               }
             }
           }
@@ -300,6 +321,26 @@ public class RemoteInterpreterServer extends Thread
 
     remoteInterpreterServer.join();
     System.exit(0);
+  }
+
+  // Submit interpreter process metadata information to cluster metadata
+  private void putClusterMeta() {
+    if (!zconf.isClusterMode()){
+      return;
+    }
+    String nodeName = clusterManagerClient.getClusterNodeName();
+
+    // commit interpreter meta
+    HashMap<String, Object> meta = new HashMap<>();
+    meta.put(ClusterMeta.NODE_NAME, nodeName);
+    meta.put(ClusterMeta.INTP_PROCESS_NAME, interpreterGroupId);
+    meta.put(ClusterMeta.INTP_TSERVER_HOST, host);
+    meta.put(ClusterMeta.INTP_TSERVER_PORT, port);
+    meta.put(ClusterMeta.INTP_START_TIME, LocalDateTime.now());
+    meta.put(ClusterMeta.LATEST_HEARTBEAT, LocalDateTime.now());
+    meta.put(ClusterMeta.STATUS, ClusterMeta.ONLINE_STATUS);
+
+    clusterManagerClient.putClusterMeta(ClusterMetaType.INTP_PROCESS_META, interpreterGroupId, meta);
   }
 
   @Override
@@ -631,13 +672,15 @@ public class RemoteInterpreterServer extends Thread
           int lastMessageIndex = resultMessages.size() - 1;
           if (resultMessages.get(lastMessageIndex).getType() == InterpreterResult.Type.TABLE) {
             context.getResourcePool().put(
-                context.getNoteId(),
-                context.getParagraphId(),
-                WellKnownResourceName.ZeppelinTableResult.toString(),
-                resultMessages.get(lastMessageIndex));
+                    context.getNoteId(),
+                    context.getParagraphId(),
+                    WellKnownResourceName.ZeppelinTableResult.toString(),
+                    resultMessages.get(lastMessageIndex));
           }
         }
         return new InterpreterResult(result.code(), resultMessages);
+      } catch (Throwable e) {
+        return new InterpreterResult(Code.ERROR, ExceptionUtils.getStackTrace(e));
       } finally {
         Thread.currentThread().setContextClassLoader(currentThreadContextClassloader);
         InterpreterContext.remove();

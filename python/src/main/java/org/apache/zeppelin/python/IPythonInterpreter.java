@@ -17,14 +17,9 @@
 
 package org.apache.zeppelin.python;
 
+import com.google.common.annotations.VisibleForTesting;
 import io.grpc.ManagedChannelBuilder;
 import org.apache.commons.exec.CommandLine;
-import org.apache.commons.exec.DefaultExecutor;
-import org.apache.commons.exec.ExecuteException;
-import org.apache.commons.exec.ExecuteResultHandler;
-import org.apache.commons.exec.ExecuteWatchdog;
-import org.apache.commons.exec.LogOutputStream;
-import org.apache.commons.exec.PumpStreamHandler;
 import org.apache.commons.exec.environment.EnvironmentUtils;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
@@ -48,6 +43,7 @@ import org.apache.zeppelin.python.proto.IPythonStatus;
 import org.apache.zeppelin.python.proto.StatusRequest;
 import org.apache.zeppelin.python.proto.StatusResponse;
 import org.apache.zeppelin.python.proto.StopRequest;
+import org.apache.zeppelin.interpreter.util.ProcessLauncher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import py4j.GatewayServer;
@@ -66,23 +62,22 @@ import java.util.Properties;
 /**
  * IPython Interpreter for Zeppelin
  */
-public class IPythonInterpreter extends Interpreter implements ExecuteResultHandler {
+public class IPythonInterpreter extends Interpreter {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(IPythonInterpreter.class);
 
-  private ExecuteWatchdog watchDog;
+  private IPythonProcessLauncher iPythonProcessLauncher;
   private IPythonClient ipythonClient;
   private GatewayServer gatewayServer;
 
   protected BaseZeppelinContext zeppelinContext;
   private String pythonExecutable;
-  private long ipythonLaunchTimeout;
+  private int ipythonLaunchTimeout;
   private String additionalPythonPath;
   private String additionalPythonInitFile;
   private boolean useBuiltinPy4j = true;
   private boolean usePy4JAuth = true;
   private String secret;
-  private volatile boolean pythonProcessRunning = false;
 
   private InterpreterOutputStream interpreterOutput = new InterpreterOutputStream(LOGGER);
 
@@ -135,7 +130,7 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
         throw new InterpreterException("IPython prerequisite is not meet: " +
             checkPrerequisiteResult);
       }
-      ipythonLaunchTimeout = Long.parseLong(
+      ipythonLaunchTimeout = Integer.parseInt(
           getProperty("zeppelin.ipython.launch.timeout", "30000"));
       this.zeppelinContext = buildZeppelinContext();
       int ipythonPort = RemoteInterpreterUtils.findRandomAvailablePortOnAllLocalInterfaces();
@@ -149,7 +144,7 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
       launchIPythonKernel(ipythonPort);
       setupJVMGateway(jvmGatewayPort);
     } catch (Exception e) {
-      throw new RuntimeException("Fail to open IPythonInterpreter", e);
+      throw new InterpreterException("Fail to open IPythonInterpreter", e);
     }
   }
 
@@ -219,7 +214,7 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
         .setCode(StringUtils.join(lines, System.lineSeparator())
             .replace("${JVM_GATEWAY_PORT}", jvmGatewayPort + "")
             .replace("${JVM_GATEWAY_ADDRESS}", serverAddress)).build());
-    if (response.getStatus() == ExecuteStatus.ERROR) {
+    if (response.getStatus() != ExecuteStatus.SUCCESS) {
       throw new IOException("Fail to setup JVMGateway\n" + response.getOutput());
     }
 
@@ -228,14 +223,14 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
     lines = IOUtils.readLines(input);
     response = ipythonClient.block_execute(ExecuteRequest.newBuilder()
         .setCode(StringUtils.join(lines, System.lineSeparator())).build());
-    if (response.getStatus() == ExecuteStatus.ERROR) {
+    if (response.getStatus() != ExecuteStatus.SUCCESS) {
       throw new IOException("Fail to import ZeppelinContext\n" + response.getOutput());
     }
 
     response = ipythonClient.block_execute(ExecuteRequest.newBuilder()
         .setCode("z = __zeppelin__ = PyZeppelinContext(intp.getZeppelinContext(), gateway)")
         .build());
-    if (response.getStatus() == ExecuteStatus.ERROR) {
+    if (response.getStatus() != ExecuteStatus.SUCCESS) {
       throw new IOException("Fail to setup ZeppelinContext\n" + response.getOutput());
     }
 
@@ -246,13 +241,12 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
           .setCode(StringUtils.join(lines, System.lineSeparator())
               .replace("${JVM_GATEWAY_PORT}", jvmGatewayPort + "")
               .replace("${JVM_GATEWAY_ADDRESS}", serverAddress)).build());
-      if (response.getStatus() == ExecuteStatus.ERROR) {
+      if (response.getStatus() != ExecuteStatus.SUCCESS) {
         throw new IOException("Fail to run additional Python init file: "
             + additionalPythonInitFile + "\n" + response.getOutput());
       }
     }
   }
-
 
   private void launchIPythonKernel(int ipythonPort)
       throws IOException {
@@ -269,11 +263,6 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
     CommandLine cmd = CommandLine.parse(pythonExecutable);
     cmd.addArgument(pythonWorkDir.getAbsolutePath() + "/ipython_server.py");
     cmd.addArgument(ipythonPort + "");
-    DefaultExecutor executor = new DefaultExecutor();
-    ProcessLogOutputStream processOutput = new ProcessLogOutputStream(LOGGER);
-    executor.setStreamHandler(new PumpStreamHandler(processOutput));
-    watchDog = new ExecuteWatchdog(ExecuteWatchdog.INFINITE_TIMEOUT);
-    executor.setWatchdog(watchDog);
 
     if (useBuiltinPy4j) {
       //TODO(zjffdu) don't do hard code on py4j here
@@ -290,38 +279,17 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
     }
 
     Map<String, String> envs = setupIPythonEnv();
-    executor.execute(cmd, envs, this);
+    iPythonProcessLauncher = new IPythonProcessLauncher(cmd, envs);
+    iPythonProcessLauncher.launch();
+    iPythonProcessLauncher.waitForReady(ipythonLaunchTimeout);
 
-    // wait until IPython kernel is started or timeout
-    long startTime = System.currentTimeMillis();
-    while (!pythonProcessRunning) {
-      try {
-        Thread.sleep(100);
-      } catch (InterruptedException e) {
-        LOGGER.error("Interrupted by something", e);
-      }
-
-      try {
-        StatusResponse response = ipythonClient.status(StatusRequest.newBuilder().build());
-        if (response.getStatus() == IPythonStatus.RUNNING) {
-          LOGGER.info("IPython Kernel is Running");
-          pythonProcessRunning = true;
-          break;
-        } else {
-          LOGGER.info("Wait for IPython Kernel to be started");
-        }
-      } catch (Exception e) {
-        // ignore the exception, because is may happen when grpc server has not started yet.
-        LOGGER.info("Wait for IPython Kernel to be started");
-      }
-
-      if ((System.currentTimeMillis() - startTime) > ipythonLaunchTimeout) {
-        throw new IOException("Fail to launch IPython Kernel in " + ipythonLaunchTimeout / 1000
-            + " seconds");
-      }
+    if (iPythonProcessLauncher.isLaunchTimeout()) {
+      throw new IOException("Fail to launch IPython Kernel in " + ipythonLaunchTimeout / 1000
+              + " seconds.\n" + iPythonProcessLauncher.getErrorMessage());
     }
-    if (!pythonProcessRunning) {
-      throw new IOException("Fail to launch IPython Kernel as the python process is failed");
+    if (!iPythonProcessLauncher.isRunning()) {
+      throw new IOException("Fail to launch IPython Kernel as the python process is failed.\n"
+              + iPythonProcessLauncher.getErrorMessage());
     }
   }
 
@@ -341,23 +309,31 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
     return envs;
   }
 
-  @Override
-  public void close() throws InterpreterException {
-    if (watchDog != null) {
-      LOGGER.info("Kill IPython Process");
-      ipythonClient.stop(StopRequest.newBuilder().build());
-      try {
-        ipythonClient.shutdown();
-      } catch (InterruptedException e) {
-        LOGGER.warn("Fail to shutdown IPythonClient");
-      }
-      watchDog.destroyProcess();
-      gatewayServer.shutdown();
-    }
+  @VisibleForTesting
+  public IPythonProcessLauncher getIPythonProcessLauncher() {
+    return iPythonProcessLauncher;
   }
 
-  public ExecuteWatchdog getWatchDog() {
-    return watchDog;
+  @Override
+  public void close() throws InterpreterException {
+    if (iPythonProcessLauncher != null) {
+      LOGGER.info("Kill IPython Process");
+      if (iPythonProcessLauncher.isRunning()) {
+        ipythonClient.stop(StopRequest.newBuilder().build());
+        try {
+          ipythonClient.shutdown();
+        } catch (InterruptedException e) {
+          LOGGER.warn("Exception happens when shutting down ipythonClient", e);
+        }
+      }
+      iPythonProcessLauncher.stop();
+      iPythonProcessLauncher = null;
+    }
+    if (gatewayServer != null) {
+      LOGGER.info("Shutdown Py4j GatewayServer");
+      gatewayServer.shutdown();
+      gatewayServer = null;
+    }
   }
 
   @Override
@@ -376,14 +352,14 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
       // or onProcessFailed) when ipython kernel process is exited. Because they are in
       // 2 different threads. So here we would check ipythonClient's status and sleep 1 second
       // if ipython kernel is maybe terminated.
-      if (pythonProcessRunning && !ipythonClient.isMaybeIPythonFailed()) {
+      if (iPythonProcessLauncher.isRunning() && !ipythonClient.isMaybeIPythonFailed()) {
         return new InterpreterResult(
                 InterpreterResult.Code.valueOf(response.getStatus().name()));
       } else {
         if (ipythonClient.isMaybeIPythonFailed()) {
           Thread.sleep(1000);
         }
-        if (pythonProcessRunning) {
+        if (iPythonProcessLauncher.isRunning()) {
           return new InterpreterResult(
                   InterpreterResult.Code.valueOf(response.getStatus().name()));
         } else {
@@ -414,7 +390,7 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
   @Override
   public List<InterpreterCompletion> completion(String buf, int cursor,
                                                 InterpreterContext interpreterContext) {
-    LOGGER.debug("Call completion for: " + buf);
+    LOGGER.debug("Call completion for: " + buf + ", cursor: " + cursor);
     List<InterpreterCompletion> completions = new ArrayList<>();
     CompletionResponse response =
         ipythonClient.complete(
@@ -426,6 +402,7 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
       if (lastIndexOfDot != -1) {
         match = match.substring(lastIndexOfDot + 1);
       }
+      LOGGER.debug("Candidate completion: " + match);
       completions.add(new InterpreterCompletion(match, match, ""));
     }
     return completions;
@@ -435,29 +412,43 @@ public class IPythonInterpreter extends Interpreter implements ExecuteResultHand
     return zeppelinContext;
   }
 
-  @Override
-  public void onProcessComplete(int exitValue) {
-    LOGGER.warn("Python Process is completed with exitValue: " + exitValue);
-    pythonProcessRunning = false;
-  }
+  class IPythonProcessLauncher extends ProcessLauncher {
 
-  @Override
-  public void onProcessFailed(ExecuteException e) {
-    LOGGER.warn("Exception happens in Python Process", e);
-    pythonProcessRunning = false;
-  }
-
-  static class ProcessLogOutputStream extends LogOutputStream {
-
-    private Logger logger;
-
-    ProcessLogOutputStream(Logger logger) {
-      this.logger = logger;
+    IPythonProcessLauncher(CommandLine commandLine,
+                           Map<String, String> envs) {
+      super(commandLine, envs);
     }
 
     @Override
-    protected void processLine(String s, int i) {
-      this.logger.debug("Process Output: " + s);
+    public void waitForReady(int timeout) {
+      // wait until IPython kernel is started or timeout
+      long startTime = System.currentTimeMillis();
+      while (state == State.LAUNCHED) {
+        try {
+          Thread.sleep(100);
+        } catch (InterruptedException e) {
+          LOGGER.error("Interrupted by something", e);
+        }
+
+        try {
+          StatusResponse response = ipythonClient.status(StatusRequest.newBuilder().build());
+          if (response.getStatus() == IPythonStatus.RUNNING) {
+            LOGGER.info("IPython Kernel is Running");
+            onProcessRunning();
+            break;
+          } else {
+            LOGGER.info("Wait for IPython Kernel to be started");
+          }
+        } catch (Exception e) {
+          // ignore the exception, because is may happen when grpc server has not started yet.
+          LOGGER.info("Wait for IPython Kernel to be started");
+        }
+
+        if ((System.currentTimeMillis() - startTime) > timeout) {
+          onTimeout();
+          break;
+        }
+      }
     }
   }
 }
